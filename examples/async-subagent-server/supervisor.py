@@ -37,7 +37,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import os  # noqa: E402
 
-RESEARCHER_URL = os.environ.get("RESEARCHER_URL", "http://localhost:2024")
+RESEARCHER_URL = os.environ.get("RESEARCHER_URL") or "http://localhost:2024"
 
 # ── Agent setup ───────────────────────────────────────────────────────────────
 

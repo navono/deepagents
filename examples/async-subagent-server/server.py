@@ -18,7 +18,7 @@ Persistence uses an in-memory SQLite database (no files, no setup required).
 The schema is created automatically on startup.
 
 Run:
-    ANTHROPIC_API_KEY=... uvicorn server:app --port 2024
+    uv run python server.py
 
 Then point a Deep Agents supervisor at:
     RESEARCHER_URL=http://localhost:2024
@@ -36,9 +36,12 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
+import httpx  # noqa: E402
+from curl_cffi import requests as _curl_requests  # noqa: E402
+from curl_cffi.requests import AsyncSession as _CurlAsyncSession  # noqa: E402
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -152,8 +155,68 @@ async def web_search(query: str) -> str:
 
 from deepagents import create_deep_agent  # noqa: E402
 
+
+class _CurlTransport(httpx.BaseTransport):
+    """httpx transport backed by curl_cffi to handle TLS-incompatible endpoints."""
+
+    _session = _curl_requests.Session()
+
+    def handle_request(self, request):
+        method = request.method if isinstance(request.method, str) else request.method.decode()
+        headers = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in request.headers.items()
+        }
+        resp = self._session.request(
+            method=method,
+            url=str(request.url),
+            headers=headers,
+            data=request.content,
+            timeout=30,
+        )
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=httpx.Headers(resp.headers),
+            content=resp.content,
+            request=request,
+        )
+
+
+class _AsyncCurlTransport(httpx.AsyncBaseTransport):
+    """Async httpx transport backed by curl_cffi."""
+
+    _session = _CurlAsyncSession()
+
+    async def handle_async_request(self, request):
+        method = request.method if isinstance(request.method, str) else request.method.decode()
+        headers = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in request.headers.items()
+        }
+        resp = await self._session.request(
+            method=method,
+            url=str(request.url),
+            headers=headers,
+            data=request.content,
+            timeout=30,
+        )
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=httpx.Headers(resp.headers),
+            content=resp.content,
+            request=request,
+        )
+
+
 _agent = create_deep_agent(
-    model=ChatAnthropic(model="claude-sonnet-4-5"),
+    model=ChatOpenAI(
+        model=os.environ.get("LLM_MODEL_NAME", "gpt-4o"),
+        base_url=os.environ.get("LLM_BASE_URL") or None,
+        api_key=os.environ.get("LLM_API_KEY"),
+        http_client=httpx.Client(transport=_CurlTransport()),
+        http_async_client=httpx.AsyncClient(transport=_AsyncCurlTransport()),
+        http_socket_options=(),
+    ),
     system_prompt=(
         "You are a thorough research agent. Investigate topics using web search and produce "
         "a well-structured research summary (300–500 words). Cite sources where possible.\n\n"
@@ -190,6 +253,7 @@ async def _execute_run(run_id: str, thread_id: str, user_message: str) -> None:
         _conn.execute("UPDATE runs SET status = 'success' WHERE run_id = ?", (run_id,))
         _conn.commit()
     except Exception as exc:  # noqa: BLE001
+        print(f"[error] Run {run_id} failed: {exc}")
         _conn.execute(
             "UPDATE runs SET status = 'error', error = ? WHERE run_id = ?",
             (str(exc), run_id),
@@ -330,3 +394,9 @@ async def cancel_run(thread_id: str, run_id: str) -> dict[str, Any]:
     _conn.execute("UPDATE runs SET status = 'cancelled' WHERE run_id = ?", (run_id,))
     _conn.commit()
     return {**run, "status": "cancelled"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 2024)))
