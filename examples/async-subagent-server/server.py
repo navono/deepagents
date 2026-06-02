@@ -27,6 +27,7 @@ Then point a Deep Agents supervisor at:
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -36,12 +37,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-import httpx  # noqa: E402
-from curl_cffi import requests as _curl_requests  # noqa: E402
-from curl_cffi.requests import AsyncSession as _CurlAsyncSession  # noqa: E402
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -116,8 +113,6 @@ def _get_run(run_id: str) -> dict[str, Any] | None:
 # Replace this with your own agent. The only requirement is that it accepts
 # a messages array and returns an object with a messages array.
 
-import os  # noqa: E402
-
 
 @tool
 async def web_search(query: str) -> str:
@@ -155,68 +150,11 @@ async def web_search(query: str) -> str:
 
 from deepagents import create_deep_agent  # noqa: E402
 
-
-class _CurlTransport(httpx.BaseTransport):
-    """httpx transport backed by curl_cffi to handle TLS-incompatible endpoints."""
-
-    _session = _curl_requests.Session()
-
-    def handle_request(self, request):
-        method = request.method if isinstance(request.method, str) else request.method.decode()
-        headers = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-            for k, v in request.headers.items()
-        }
-        resp = self._session.request(
-            method=method,
-            url=str(request.url),
-            headers=headers,
-            data=request.content,
-            timeout=30,
-        )
-        return httpx.Response(
-            status_code=resp.status_code,
-            headers=httpx.Headers(resp.headers),
-            content=resp.content,
-            request=request,
-        )
-
-
-class _AsyncCurlTransport(httpx.AsyncBaseTransport):
-    """Async httpx transport backed by curl_cffi."""
-
-    _session = _CurlAsyncSession()
-
-    async def handle_async_request(self, request):
-        method = request.method if isinstance(request.method, str) else request.method.decode()
-        headers = {
-            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-            for k, v in request.headers.items()
-        }
-        resp = await self._session.request(
-            method=method,
-            url=str(request.url),
-            headers=headers,
-            data=request.content,
-            timeout=30,
-        )
-        return httpx.Response(
-            status_code=resp.status_code,
-            headers=httpx.Headers(resp.headers),
-            content=resp.content,
-            request=request,
-        )
+from examples_utils import create_chat_model  # noqa: E402
 
 
 _agent = create_deep_agent(
-    model=ChatOpenAI(
-        model=os.environ.get("LLM_MODEL_NAME", "gpt-4o"),
-        base_url=os.environ.get("LLM_BASE_URL") or None,
-        api_key=os.environ.get("LLM_API_KEY"),
-        http_client=httpx.Client(transport=_CurlTransport()),
-        http_async_client=httpx.AsyncClient(transport=_AsyncCurlTransport()),
-        http_socket_options=(),
-    ),
+    model=create_chat_model(transport="curl_cffi"),
     system_prompt=(
         "You are a thorough research agent. Investigate topics using web search and produce "
         "a well-structured research summary (300–500 words). Cite sources where possible.\n\n"
