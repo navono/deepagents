@@ -18,6 +18,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "langgraph-cli[inmem]>=0.1.55",
     "langchain-google-genai>=3.1.0",
+    "curl-cffi>=0.15.0",
 ]
 
 [tool.uv]
