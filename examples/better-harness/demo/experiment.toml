@@ -1,0 +1,171 @@
+# Task Assistant Demo — Better Harness Experiment
+#
+# A self-contained demo that exercises all better-harness features:
+# - Both surface kinds: module_attr + workspace_file
+# - Both value sources: base_value + base_file
+# - All three splits: train (4) + holdout (4) + scorecard (2)
+# - 5 editable surfaces, 10 eval cases, 6 strata
+#
+# Run:
+#   uv run better-harness validate demo/experiment.toml
+#   uv run better-harness run demo/experiment.toml --output-dir runs/demo --max-iterations 4
+
+[experiment]
+name = "task-assistant-demo"
+runner = "pytest"
+workspace_root = "workspace"
+model = "demo-model"
+max_iterations = 4
+
+[better_agent]
+model = "claude-sonnet-4-6"
+max_turns = 40
+
+[runner.pytest]
+project_root = "evals"
+model_flag = "--model"
+summary_flag = "--evals-report-file"
+pytest_args = ["-q"]
+
+# ---------------------------------------------------------------------------
+# Surfaces — 5 editable surfaces covering both kinds and both value sources
+# ---------------------------------------------------------------------------
+
+# Surface 1: module_attr + base_value
+#   Patches the TASK_BOT_PROMPT attribute on the task_bot module.
+[surfaces.prompt]
+kind = "module_attr"
+target = "task_bot:TASK_BOT_PROMPT"
+filename = "prompt.txt"
+base_value = """
+You are a task management assistant. Help users with their tasks.
+"""
+
+# Surface 2: workspace_file + base_value
+#   Replaces the custom_tools.py file in the workspace.
+[surfaces.tools]
+kind = "workspace_file"
+target = "custom_tools.py"
+filename = "custom_tools.py"
+base_value = """
+\"\"\"Task management tools.\"\"\"
+
+
+def create_task(title: str, description: str = \"\") -> str:
+    \"\"\"Create a new task.\"\"\"
+    return f\"Created task: {title}\"
+"""
+
+# Surface 3: workspace_file + base_value
+#   Replaces the skills guide file.
+[surfaces.skills]
+kind = "workspace_file"
+target = "skills.md"
+filename = "skills.md"
+base_value = """
+# Task Assistant Skills
+
+Be helpful.
+"""
+
+# Surface 4: workspace_file + base_file
+#   Replaces middleware.py, initial value from external file.
+#   This exercises the base_file value source (vs base_value above).
+[surfaces.middleware_impl]
+kind = "workspace_file"
+target = "middleware.py"
+filename = "middleware.py"
+base_file = "base_files/middleware.py"
+
+# Surface 5: workspace_file + base_value
+#   Replaces the agent construction file.
+#   Middleware needs both implementation AND registration surfaces.
+#   If only the implementation is exposed but not the wiring, the outer
+#   agent cannot actually enable the middleware.
+[surfaces.middleware_registration]
+kind = "workspace_file"
+target = "bot_builder.py"
+filename = "bot_builder.py"
+base_value = """
+\"\"\"Agent construction.\"\"\"
+
+
+def build_agent(model: str):
+    \"\"\"Build a task assistant agent.\"\"\"
+    from custom_tools import create_task
+    from task_bot import TASK_BOT_PROMPT
+
+    return {
+        \"model\": model,
+        \"tools\": [create_task],
+        \"middleware\": [],
+        \"prompt\": TASK_BOT_PROMPT,
+    }
+"""
+
+# ---------------------------------------------------------------------------
+# Eval cases — 10 cases across 3 splits
+# ---------------------------------------------------------------------------
+#
+# Strata symmetry constraint: train and holdout must cover identical strata.
+#   train    = {tools, tools_advanced, prompt, guardrails}
+#   holdout  = {tools, tools_advanced, prompt, guardrails}
+#   scorecard = {combined, format}
+#
+# Baseline expectation: all 10 cases FAIL
+
+# --- Train (4 cases, visible to outer agent) ---
+
+[[cases]]
+case_id = "tests/test_tool_selection.py::test_direct_create_task"
+split = "train"
+stratum = "tools"
+
+[[cases]]
+case_id = "tests/test_tool_selection.py::test_search_tasks_available"
+split = "train"
+stratum = "tools_advanced"
+
+[[cases]]
+case_id = "tests/test_prompt_behavior.py::test_followup_policy"
+split = "train"
+stratum = "prompt"
+
+[[cases]]
+case_id = "tests/test_skills_middleware.py::test_escalation_rules"
+split = "train"
+stratum = "guardrails"
+
+# --- Holdout (4 cases, invisible to outer agent) ---
+
+[[cases]]
+case_id = "tests/test_tool_selection.py::test_categorize_tool_exists"
+split = "holdout"
+stratum = "tools"
+
+[[cases]]
+case_id = "tests/test_prompt_behavior.py::test_priority_levels"
+split = "holdout"
+stratum = "prompt"
+
+[[cases]]
+case_id = "tests/test_skills_middleware.py::test_duplicate_detection"
+split = "holdout"
+stratum = "tools_advanced"
+
+[[cases]]
+case_id = "tests/test_safety_format.py::test_safety_refusal"
+split = "holdout"
+stratum = "guardrails"
+
+# --- Scorecard (2 cases, run only at baseline and final) ---
+
+[[cases]]
+case_id = "tests/test_skills_middleware.py::test_combined_workflow"
+split = "scorecard"
+stratum = "combined"
+
+[[cases]]
+case_id = "tests/test_safety_format.py::test_output_format"
+split = "scorecard"
+stratum = "format"

@@ -599,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
     result_path = Path(args[1]).resolve()
     payload = json.loads(request_path.read_text())
 
+    import my_provider  # noqa: F401 — register custom provider profile before model resolution
+
     filesystem_module = importlib.import_module("deepagents.backends")
     graph_module = importlib.import_module("deepagents.graph")
     messages_module = importlib.import_module("langchain_core.messages")

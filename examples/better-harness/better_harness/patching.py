@@ -104,6 +104,7 @@ def ensure_sitecustomize(runtime_dir: Path) -> Path:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     sitecustomize_path = runtime_dir / "sitecustomize.py"
     sitecustomize_path.write_text(
+        "import my_provider\n"
         "from better_harness.patching import patch_from_env\n"
         "patch_from_env()\n"
     )

@@ -869,6 +869,8 @@ def run_experiment(
     reuse_existing: bool = False,
 ) -> RunReport:
     """Run the better-harness optimization loop."""
+    import my_provider  # noqa: F401 — register custom provider profile before model resolution
+
     from better_harness.agent import propose_variant
     from better_harness.patching import build_baseline_variant
     from better_harness.runners import build_runner
