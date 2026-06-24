@@ -30,6 +30,9 @@ from deepagents.backends.sandbox import (
     _READ_COMMAND_TEMPLATE,
     _WRITE_CHECK_TEMPLATE,
     BaseSandbox,
+    _check_preflight_result,
+    _map_edit_error,
+    _parse_grep_output,
 )
 
 
@@ -39,6 +42,7 @@ class MockSandbox(BaseSandbox):
     def __init__(self) -> None:
         self.last_command: str | None = None
         self._next_output: str = "1"
+        self._next_exit_code: int = 0
         self._uploaded: list[tuple[str, bytes]] = []
         self._file_store: dict[str, bytes] = {}
 
@@ -54,8 +58,10 @@ class MockSandbox(BaseSandbox):
         if "old_path = base64.b64decode(" in command and has_tmp:
             return self._simulate_edit_tmpfile(command)
         output = self._next_output
+        exit_code = self._next_exit_code
         self._next_output = "1"
-        return ExecuteResponse(output=output, exit_code=0, truncated=False)
+        self._next_exit_code = 0
+        return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
 
     def _simulate_edit_tmpfile(self, command: str) -> ExecuteResponse:
         """Simulate the server-side temp-file edit script.
@@ -363,6 +369,137 @@ def test_ls_command_base64_encodes_path() -> None:
     expected_b64 = base64.b64encode(b"/test/dir").decode("ascii")
     assert expected_b64 in sandbox.last_command
     assert "python3 -c" in sandbox.last_command
+
+
+# -- grep tests ---------------------------------------------------------------
+
+
+def test_grep_parses_matches() -> None:
+    """grep() parses path, line number, and matched text from grep output."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "/test/file.txt\00012:needle here"
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.error is None
+    assert result.matches == [
+        {
+            "path": "/test/file.txt",
+            "line": 12,
+            "text": "needle here",
+        }
+    ]
+
+
+def test_grep_parses_matches_with_colons_in_filename_and_text() -> None:
+    """grep() handles colon-containing filenames and matched text."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "/test/foo:bar.txt\00012:http://example.com"
+
+    result = sandbox.grep("http", "/test")
+
+    assert result.error is None
+    assert result.matches == [
+        {
+            "path": "/test/foo:bar.txt",
+            "line": 12,
+            "text": "http://example.com",
+        }
+    ]
+
+
+def test_grep_preserves_matches_when_later_output_is_malformed() -> None:
+    """grep() keeps parsed matches when one output line is malformed."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "/test/file.txt\00012:needle here\nmalformed output"
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.error is None
+    assert result.matches == [
+        {
+            "path": "/test/file.txt",
+            "line": 12,
+            "text": "needle here",
+        }
+    ]
+
+
+def test_grep_defaults_path_to_current_directory() -> None:
+    """grep() searches the current directory when no path is provided."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "./file.txt\0001:needle"
+
+    result = sandbox.grep("needle")
+
+    assert result.error is None
+    assert result.matches == [
+        {
+            "path": "./file.txt",
+            "line": 1,
+            "text": "needle",
+        }
+    ]
+    assert sandbox.last_command is not None
+    assert " ." in sandbox.last_command
+
+
+def test_grep_passes_glob_include() -> None:
+    """grep() passes the optional glob through to grep include."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "/test/file.py\0001:needle"
+
+    result = sandbox.grep("needle", "/test", "*.py")
+
+    assert result.error is None
+    assert sandbox.last_command is not None
+    assert "--include='*.py'" in sandbox.last_command
+
+
+def test_grep_returns_empty_matches_for_successful_empty_output() -> None:
+    """grep() returns no matches when grep succeeds with no output."""
+    sandbox = MockSandbox()
+    sandbox._next_output = ""
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.error is None
+    assert result.matches == []
+
+
+def test_grep_returns_error_for_backend_exec_failure() -> None:
+    """grep() surfaces container exec failures instead of parsing stderr text."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "OCI runtime exec failed: chdir /does-not-exist: exec failed"
+    sandbox._next_exit_code = 126
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.matches is None
+    assert result.error == "Path '/test': OCI runtime exec failed: chdir /does-not-exist: exec failed"
+
+
+def test_grep_returns_exit_code_when_backend_exec_failure_has_no_output() -> None:
+    """grep() includes the exit code when the backend failure has no diagnostic."""
+    sandbox = MockSandbox()
+    sandbox._next_output = ""
+    sandbox._next_exit_code = 126
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.matches is None
+    assert result.error == "Path '/test': exit code 126"
+
+
+def test_grep_returns_error_for_malformed_output_with_zero_exit() -> None:
+    """grep() does not crash if backend diagnostics leak with a zero exit code."""
+    sandbox = MockSandbox()
+    sandbox._next_output = "OCI runtime exec failed: chdir /does-not-exist: exec failed"
+
+    result = sandbox.grep("needle", "/test")
+
+    assert result.matches is None
+    assert result.error == "Path '/test': OCI runtime exec failed: chdir /does-not-exist: exec failed"
 
 
 # -- write tests --------------------------------------------------------------
@@ -733,7 +870,7 @@ def test_sandbox_grep_literal_search() -> None:
             # -F can appear as standalone "-F" or combined like "-rHnF"
             assert "-F" in command or "F" in command.split("grep", 1)[1].split(maxsplit=1)[0], "grep should use -F flag for literal search"
             return ExecuteResponse(
-                output="/test/code.py:1:def __init__(self):\n/test/types.py:1:str | int",
+                output="/test/code.py\0001:def __init__(self):\n/test/types.py\0001:str | int",
                 exit_code=0,
                 truncated=False,
             )
@@ -750,9 +887,9 @@ def test_sandbox_grep_literal_search() -> None:
     matches = sandbox.grep("str | int", path="/test").matches
     assert matches is not None
 
-    # Verify the command uses grep -rHnF for literal search (combined flags)
+    # Verify the command uses grep -rHnFZ for literal search and NUL-delimited paths.
     assert sandbox.last_command is not None
-    assert "grep -rHnF" in sandbox.last_command
+    assert "grep -rHnFZ" in sandbox.last_command
 
 
 def test_sandbox_grep_quotes_include_glob() -> None:
@@ -900,7 +1037,7 @@ def test_sandbox_edit_one_over_threshold_uses_upload() -> None:
 
 def test_map_edit_error_unknown_code_falls_through() -> None:
     """Test that _map_edit_error returns a generic error for unrecognized codes."""
-    result = BaseSandbox._map_edit_error("temp_read_failed", "/test/file.txt", "old")
+    result = _map_edit_error("temp_read_failed", "/test/file.txt", "old")
 
     assert result.error is not None
     assert "temp_read_failed" in result.error
@@ -1160,7 +1297,7 @@ def test_glob_empty_returns_empty_matches() -> None:
 
 def test_map_edit_error_permission_denied() -> None:
     """_map_edit_error returns a readable message for permission_denied."""
-    result = BaseSandbox._map_edit_error("permission_denied", "/test/file.txt", "old")
+    result = _map_edit_error("permission_denied", "/test/file.txt", "old")
     assert result.error is not None
     assert "permission" in result.error.lower()
     assert "/test/file.txt" in result.error
@@ -1192,3 +1329,204 @@ def test_sandbox_edit_inline_permission_denied() -> None:
     assert result.error is not None
     assert "permission" in result.error.lower()
     assert "/test/locked.txt" in result.error
+
+
+# -- async override tests (issue #665) ----------------------------------------
+#
+# These tests verify that the async helpers on BaseSandbox call aexecute()
+# rather than wrapping the sync methods with asyncio.to_thread. The fixture is
+# a NativeAsyncSandbox that overrides aexecute() with a coroutine that records
+# all calls, while execute() raises to prove it is never reached.
+
+
+class NativeAsyncSandbox(BaseSandbox):
+    """Sandbox where aexecute() is natively async; execute() always raises."""
+
+    def __init__(self) -> None:
+        self._aexecute_calls: list[str] = []
+        self._aupload_calls: list[list[tuple[str, bytes]]] = []
+        self._next_output: str = ""
+        self._next_exit_code: int = 0
+
+    @property
+    def id(self) -> str:
+        return "native-async-sandbox"
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        msg = "sync execute() must not be called from async helpers"
+        raise RuntimeError(msg)
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:  # noqa: ASYNC109
+        self._aexecute_calls.append(command)
+        output = self._next_output
+        exit_code = self._next_exit_code
+        return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        msg = "sync upload_files() must not be called from async helpers"
+        raise RuntimeError(msg)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        self._aupload_calls.append(files)
+        return [FileUploadResponse(path=f[0], error=None) for f in files]
+
+    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+        msg = "sync download_files() must not be called from async helpers"
+        raise RuntimeError(msg)
+
+
+async def test_als_calls_aexecute() -> None:
+    """als() must call aexecute(), not the sync execute()."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = json.dumps({"path": "/foo/bar.txt", "is_dir": False})
+
+    result = await sandbox.als("/foo")
+
+    assert len(sandbox._aexecute_calls) == 1
+    assert result.error is None
+    assert result.entries is not None
+
+
+async def test_aread_calls_aexecute() -> None:
+    """aread() must call aexecute(), not the sync execute()."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = json.dumps({"encoding": "utf-8", "content": "hello"})
+
+    result = await sandbox.aread("/foo/bar.txt")
+
+    assert len(sandbox._aexecute_calls) == 1
+    assert result.error is None
+    assert result.file_data is not None
+
+
+async def test_agrep_calls_aexecute() -> None:
+    """agrep() must call aexecute(), not the sync execute()."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = "/foo/bar.txt\x00" + "1:hello"
+    sandbox._next_exit_code = 0
+
+    result = await sandbox.agrep("hello")
+
+    assert len(sandbox._aexecute_calls) == 1
+    assert result.error is None
+
+
+async def test_aglob_calls_aexecute() -> None:
+    """aglob() must call aexecute(), not the sync execute()."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = json.dumps({"path": "/foo/bar.txt", "is_dir": False})
+
+    result = await sandbox.aglob("**/*.txt")
+
+    assert len(sandbox._aexecute_calls) == 1
+    assert result.error is None
+    assert result.matches is not None
+
+
+async def test_awrite_calls_aexecute_and_aupload_files() -> None:
+    """awrite() must call aexecute() for preflight and aupload_files(), not sync methods."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = ""
+    sandbox._next_exit_code = 0
+
+    result = await sandbox.awrite("/foo/new.txt", "content")
+
+    assert len(sandbox._aexecute_calls) == 1, "expected one aexecute call for preflight"
+    assert len(sandbox._aupload_calls) == 1, "expected one aupload_files call"
+    assert result.error is None
+    assert result.path == "/foo/new.txt"
+
+
+async def test_aedit_inline_calls_aexecute() -> None:
+    """aedit() (small payload) must call aexecute(), not the sync execute()."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = json.dumps({"count": 1})
+
+    result = await sandbox.aedit("/foo/bar.txt", "old", "new")
+
+    assert len(sandbox._aexecute_calls) == 1
+    assert result.error is None
+    assert result.occurrences == 1
+
+
+async def test_aedit_via_upload_calls_aexecute_and_aupload_files() -> None:
+    """aedit() (large payload) must call aexecute() and aupload_files(), not sync methods."""
+    sandbox = NativeAsyncSandbox()
+    sandbox._next_output = json.dumps({"count": 1})
+    large = "x" * (_EDIT_INLINE_MAX_BYTES + 1)
+
+    result = await sandbox.aedit("/foo/bar.txt", large, "new")
+
+    assert len(sandbox._aupload_calls) == 1, "expected one aupload_files call for temp files"
+    assert len(sandbox._aexecute_calls) == 1, "expected one aexecute call for server-side replace"
+    assert result.error is None
+
+
+# -- direct unit tests for module-level helper functions ----------------------
+
+
+def test_map_edit_error_file_not_found() -> None:
+    result = _map_edit_error("file_not_found", "/a/b.txt", "old")
+    assert result.error is not None
+    assert "not found" in result.error.lower()
+    assert "/a/b.txt" in result.error
+
+
+def test_map_edit_error_not_a_file() -> None:
+    result = _map_edit_error("not_a_file", "/a/b.txt", "old")
+    assert result.error is not None
+    assert "not a regular file" in result.error.lower()
+    assert "/a/b.txt" in result.error
+
+
+def test_map_edit_error_not_a_text_file() -> None:
+    result = _map_edit_error("not_a_text_file", "/a/b.bin", "old")
+    assert result.error is not None
+    assert "not a text file" in result.error.lower()
+    assert "/a/b.bin" in result.error
+
+
+def test_map_edit_error_string_not_found() -> None:
+    result = _map_edit_error("string_not_found", "/a/b.txt", "needle")
+    assert result.error is not None
+    assert "not found" in result.error.lower()
+    assert "needle" in result.error
+
+
+def test_map_edit_error_multiple_occurrences() -> None:
+    result = _map_edit_error("multiple_occurrences", "/a/b.txt", "needle")
+    assert result.error is not None
+    assert "multiple" in result.error.lower() or "replace_all" in result.error
+    assert "needle" in result.error
+
+
+def test_check_preflight_result_nonzero_exit_returns_error() -> None:
+    resp = ExecuteResponse(output="Error: file exists", exit_code=1, truncated=False)
+    result = _check_preflight_result(resp, "/a/b.txt")
+    assert result is not None
+    assert result.error is not None
+    assert "Error: file exists" in result.error
+
+
+def test_check_preflight_result_error_in_output_returns_error() -> None:
+    resp = ExecuteResponse(output="Error: parent dir missing", exit_code=0, truncated=False)
+    result = _check_preflight_result(resp, "/a/b.txt")
+    assert result is not None
+    assert result.error is not None
+    assert "Error: parent dir missing" in result.error
+
+
+def test_check_preflight_result_success_returns_none() -> None:
+    resp = ExecuteResponse(output="", exit_code=0, truncated=False)
+    result = _check_preflight_result(resp, "/a/b.txt")
+    assert result is None
+
+
+def test_parse_grep_output_non_integer_line_number_is_skipped() -> None:
+    # Format: path\0not_a_number:text — int() raises ValueError, line is treated as parse error.
+    output = "file.py\0not_a_number:some text"
+    resp = ExecuteResponse(output=output, exit_code=0, truncated=False)
+    result = _parse_grep_output(resp, ".")
+    # The only line has a bad line number; no valid matches → error is set.
+    assert result.matches is None or result.matches == []
+    assert result.error is not None

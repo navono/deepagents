@@ -83,8 +83,8 @@ class TestLaunchNameScreen:
 
         assert name_input.placeholder == "Your name (optional)"
 
-    async def test_copy_explains_name_memory_and_skip(self) -> None:
-        """The name screen should describe memory and skip semantics."""
+    async def test_copy_prompts_for_name_and_hides_skip_hint(self) -> None:
+        """The name screen prompts for a name without advertising the skip hint."""
         app = LaunchNameTestApp()
         async with app.run_test() as pilot:
             app.show_name_screen()
@@ -93,8 +93,9 @@ class TestLaunchNameScreen:
             copy = app.screen.query_one(".launch-init-copy", Static)
             help_text = app.screen.query_one(".launch-init-help", Static)
 
-        assert "remembered for future sessions" in str(copy.content)
-        assert "Esc skip setup" in str(help_text.content)
+        assert "What should Deep Agents call you?" in str(copy.content)
+        assert "Enter to continue" in str(help_text.content)
+        assert "Esc skip setup" not in str(help_text.content)
 
     async def test_submit_returns_normalized_name(self) -> None:
         """Submitting a name should dismiss with the trimmed, title-cased value."""
@@ -195,7 +196,8 @@ class TestLaunchDependenciesScreen:
         assert "Available to add" in content
         assert "Model providers: bedrock" in content
         assert "Sandboxes: runloop" in content
-        assert "Esc skip setup" in content
+        assert "Enter to continue" in content
+        assert "Esc skip setup" not in content
 
     async def test_enter_continues(self) -> None:
         """Enter should continue to the next onboarding step."""
@@ -258,8 +260,8 @@ class TestLaunchDependenciesScreen:
                 msg = "stack torn down"
                 raise ScreenStackError(msg)
 
-            app.switch_screen = fake_switch_screen  # type: ignore[method-assign]
-            app.notify = fake_notify  # type: ignore[method-assign]
+            app.switch_screen = fake_switch_screen  # ty: ignore
+            app.notify = fake_notify  # ty: ignore
 
             await pilot.press("enter")
             await pilot.pause()

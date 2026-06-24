@@ -9,13 +9,17 @@ import pytest
 
 from deepagents_code.extras_info import (
     _COMPOSITE_EXTRAS,
+    KNOWN_EXTRAS,
     MODEL_PROVIDER_EXTRAS,
     SANDBOX_EXTRAS,
     STANDALONE_EXTRAS,
+    extra_for_package,
     format_extras_status,
     format_extras_status_plain,
+    format_known_extras,
     get_extras_status,
     get_optional_dependency_status,
+    resolve_sdk_version,
     verify_interpreter_deps,
 )
 
@@ -135,6 +139,28 @@ def test_skips_entries_without_extra_marker() -> None:
     assert extras == {"foo": [("gated-pkg", "1.2.3")]}
 
 
+def test_extra_for_package_returns_declaring_known_extra() -> None:
+    """Package lookup should use declared extras instead of provider-name guesses."""
+    mock_dist = MagicMock()
+    mock_dist.requires = [
+        "langchain-google-vertexai>=3.2.3,<4.0.0 ; extra == 'vertex'",
+        "deepagents-code[anthropic,baseten] ; extra == 'all-providers'",
+    ]
+
+    with patch("deepagents_code.extras_info.distribution", return_value=mock_dist):
+        assert extra_for_package("langchain-google-vertexai") == "vertex"
+
+
+def test_extra_for_package_returns_none_for_unknown_package() -> None:
+    mock_dist = MagicMock()
+    mock_dist.requires = [
+        "langchain-google-vertexai>=3.2.3,<4.0.0 ; extra == 'vertex'",
+    ]
+
+    with patch("deepagents_code.extras_info.distribution", return_value=mock_dist):
+        assert extra_for_package("not-declared") is None
+
+
 def test_skips_composite_self_referencing_extras() -> None:
     mock_dist = MagicMock()
     mock_dist.requires = [
@@ -163,6 +189,7 @@ def test_skips_known_composite_extras() -> None:
         "langchain-anthropic>=1.0.0 ; extra == 'all-providers'",
         "langchain-baseten>=1.0.0 ; extra == 'all-providers'",
         "langchain-daytona>=1.0.0 ; extra == 'all-sandboxes'",
+        "langchain-vercel-sandbox>=0.0.1 ; extra == 'all-sandboxes'",
         "langchain-anthropic>=1.0.0 ; extra == 'anthropic'",
     ]
 
@@ -223,6 +250,17 @@ def test_extras_taxonomy_covers_pyproject() -> None:
     )
 
 
+def test_known_extras_is_union_of_categories() -> None:
+    """`KNOWN_EXTRAS` must be the union of the three category frozensets.
+
+    `dcode --install <extra>` and `/install <extra>` consult `KNOWN_EXTRAS`
+    to decide whether to prompt for confirmation on unknown values, so this
+    set has to stay aligned with the taxonomy or callers will see spurious
+    prompts for real extras.
+    """
+    assert KNOWN_EXTRAS == (MODEL_PROVIDER_EXTRAS | SANDBOX_EXTRAS | STANDALONE_EXTRAS)
+
+
 def test_extras_categories_are_disjoint() -> None:
     """An extra can only be classified in one taxonomy set."""
     pairs = (
@@ -234,12 +272,64 @@ def test_extras_categories_are_disjoint() -> None:
         assert not overlap, f"Extras classified twice in {label}: {sorted(overlap)}"
 
 
-def test_verify_interpreter_deps_raises_when_module_missing() -> None:
+def _parse_known_extras(rendered: str) -> dict[str, list[str]]:
+    """Parse `format_known_extras` output into `{label: [extras]}`.
+
+    Lets tests assert per-line grouping and ordering rather than matching
+    substrings against the whole blob, which would pass even if extras were
+    rendered under the wrong category or all collapsed onto one line.
+    """
+    groups: dict[str, list[str]] = {}
+    for line in rendered.splitlines()[1:]:  # skip the "Available extras:" header
+        label, _, extras = line.strip().partition(": ")
+        groups[label] = extras.split(", ")
+    return groups
+
+
+def test_format_known_extras_lists_exactly_known_extras() -> None:
+    """The listing must contain every `KNOWN_EXTRAS` member and nothing else."""
+    rendered = format_known_extras()
+    assert rendered.startswith("Available extras:")
+    groups = _parse_known_extras(rendered)
+    rendered_extras = {extra for extras in groups.values() for extra in extras}
+    # Bidirectional: catches both a new category left out of the listing and a
+    # listing that drifts ahead of `KNOWN_EXTRAS`.
+    assert rendered_extras == set(KNOWN_EXTRAS)
+
+
+def test_format_known_extras_groups_extras_under_correct_label() -> None:
+    """Each category renders under its own label with alphabetical ordering."""
+    groups = _parse_known_extras(format_known_extras())
+    assert groups["Model providers"] == sorted(MODEL_PROVIDER_EXTRAS)
+    assert groups["Sandboxes"] == sorted(SANDBOX_EXTRAS)
+    assert groups["Other"] == sorted(STANDALONE_EXTRAS)
+
+
+# `verify_interpreter_deps` does a lazy `from deepagents_code.config import
+# _is_editable_install` each call, so the symbol is resolved against
+# `deepagents_code.config` at call time. Patch the source module — patching
+# `deepagents_code.extras_info._is_editable_install` would not work (it isn't
+# bound there as a module-level attribute).
+def test_verify_interpreter_deps_raises_with_dcode_hint_for_tool_install() -> None:
     with (
         patch(
             "deepagents_code.extras_info.importlib.util.find_spec", return_value=None
         ),
-        pytest.raises(ImportError, match="deepagents-code\\[quickjs\\]"),
+        patch("deepagents_code.config._is_editable_install", return_value=False),
+        pytest.raises(ImportError, match="dcode --install quickjs"),
+    ):
+        verify_interpreter_deps()
+
+
+def test_verify_interpreter_deps_raises_with_uv_hint_for_editable_install() -> None:
+    with (
+        patch(
+            "deepagents_code.extras_info.importlib.util.find_spec", return_value=None
+        ),
+        patch("deepagents_code.config._is_editable_install", return_value=True),
+        pytest.raises(
+            ImportError, match=r"uv tool install --editable.*deepagents-code\[quickjs\]"
+        ),
     ):
         verify_interpreter_deps()
 
@@ -266,3 +356,34 @@ def test_format_extras_status_renders_markdown_table() -> None:
     assert lines[3] == "| --- | --- | --- |"
     assert lines[4] == "| anthropic | langchain-anthropic | 1.4.0 |"
     assert lines[5] == "| daytona | langchain-daytona | 0.0.4 |"
+
+
+class TestResolveSdkVersion:
+    """Tests for the shared `deepagents` SDK version resolver."""
+
+    def test_resolved_returns_version(self) -> None:
+        """A successful lookup reports the version and `resolved` status."""
+        with patch(
+            "deepagents_code.extras_info.pkg_version", return_value="1.2.3"
+        ) as mock:
+            version, status = resolve_sdk_version()
+        mock.assert_called_once_with("deepagents")
+        assert (version, status) == ("1.2.3", "resolved")
+
+    def test_not_installed_distinguished_from_error(self) -> None:
+        """A missing package reports `not_installed`, never `error`."""
+        with patch(
+            "deepagents_code.extras_info.pkg_version",
+            side_effect=PackageNotFoundError("deepagents"),
+        ):
+            version, status = resolve_sdk_version()
+        assert (version, status) == (None, "not_installed")
+
+    def test_unexpected_error_reports_error_status(self) -> None:
+        """Any non-`PackageNotFoundError` failure reports `error`, not a crash."""
+        with patch(
+            "deepagents_code.extras_info.pkg_version",
+            side_effect=RuntimeError("corrupt metadata"),
+        ):
+            version, status = resolve_sdk_version()
+        assert (version, status) == (None, "error")

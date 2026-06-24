@@ -129,7 +129,7 @@ from langchain.agents.middleware.types import (
 )
 from langgraph.prebuilt import ToolRuntime
 
-from deepagents.backends.protocol import FILE_NOT_FOUND, FileDownloadResponse, LsResult
+from deepagents.backends.protocol import FILE_NOT_FOUND, FileDownloadResponse, LsResult, _resolve_backend
 from deepagents.backends.utils import to_posix_path
 from deepagents.middleware._utils import append_to_system_message
 
@@ -720,7 +720,7 @@ Skills follow a **progressive disclosure** pattern - you see their name and desc
 
 1. **Recognize when a skill applies**: Check if the user's task matches a skill's description
 2. **Read the skill's full instructions**: Use `read_file` on the path shown in the skill list above.
-   Pass `limit=1000` since the default of 100 lines is too small for most skill files.
+    Pass `limit=1000` since the default of 100 lines is too small for most skill files.
 3. **Follow the skill's instructions**: SKILL.md contains step-by-step workflows, best practices, and examples
 4. **Access supporting files**: Skills may include helper scripts, configs, or reference docs - use absolute paths
 
@@ -738,7 +738,7 @@ Skills may contain Python scripts or other executable files. Always use absolute
 User: "Can you research the latest developments in quantum computing?"
 
 1. Check available skills -> See "web-research" skill with its path
-2. Read the full skill file: `read_file(path, limit=1000)`
+2. Read the full skill file: `read_file(file_path="...", limit=1000)`
 3. Follow the skill's research workflow (search -> organize -> synthesize)
 4. Use any helper scripts with absolute paths
 
@@ -852,7 +852,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
                 config=config,
                 tool_call_id=None,
             )
-            backend = self._backend(tool_runtime)  # ty: ignore[call-top-callable, invalid-argument-type]
+            backend = _resolve_backend(self._backend, tool_runtime)
             if backend is None:
                 msg = "SkillsMiddleware requires a valid backend instance"
                 raise AssertionError(msg)

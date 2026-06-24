@@ -29,7 +29,7 @@ import os
 import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -55,6 +55,17 @@ class ApiKeyCredential(TypedDict):
 
     added_at: str
     """ISO-8601 UTC timestamp recording when the credential was stored."""
+
+    base_url: NotRequired[str]
+    """Optional provider endpoint paired with this key.
+
+    Stored only when the user supplied one in `/auth`. A key and its endpoint
+    form a coherent pair — applying the key also applies (or, when this is
+    absent, resets to the provider default) the base URL, so a personal key is
+    never sent to a gateway it doesn't belong to. Not treated as a secret (it is
+    logged when malformed and surfaced in hints); avoid embedding credentials in
+    the URL.
+    """
 
 
 class OAuthCredential(TypedDict):
@@ -90,8 +101,8 @@ class WriteOutcome:
     """User-visible warning strings (e.g., chmod failures). Empty on success."""
 
 
-def _auth_path() -> Path:
-    """Return `~/.deepagents/.state/auth.json`.
+def auth_path() -> Path:
+    """Return the resolved path to the credential store (`auth.json`).
 
     Resolved at call time (not import time) so tests can redirect storage by
     monkeypatching `deepagents_code.model_config.DEFAULT_STATE_DIR` — same
@@ -112,7 +123,7 @@ def _read_raw() -> dict | None:
         RuntimeError: If the file exists but cannot be parsed or has an
             unsupported schema version.
     """
-    path = _auth_path()
+    path = auth_path()
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
@@ -162,7 +173,7 @@ def _write_raw(data: dict) -> tuple[str, ...]:
         surface to the user. Empty when permissions were locked down
         successfully (or on Windows where POSIX modes don't apply).
     """
-    path = _auth_path()
+    path = auth_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     warnings: list[str] = []
     if hasattr(os, "chmod"):
@@ -214,6 +225,33 @@ def _write_raw(data: dict) -> tuple[str, ...]:
     return tuple(warnings)
 
 
+def _write_raw_or_raise(data: dict) -> tuple[str, ...]:
+    """Write `data` via `_write_raw`, converting write failures to `RuntimeError`.
+
+    `_write_raw` lets `OSError` from the atomic write (no disk space, an
+    unwritable state directory, a cross-device rename of the temp file)
+    propagate. The public writers document `RuntimeError` for unrecoverable
+    store failures, so translate here with a remediation hint instead of
+    leaking a raw traceback to the caller (CLI or TUI). The message never
+    includes the credential value.
+
+    Returns:
+        The chmod-warning tuple from `_write_raw` on success.
+
+    Raises:
+        RuntimeError: If the underlying write fails with an `OSError`.
+    """
+    try:
+        return _write_raw(data)
+    except OSError as exc:
+        msg = (
+            f"Failed to write credential file {auth_path()}: {exc}. "
+            "Check available disk space and the permissions on the parent "
+            "directory."
+        )
+        raise RuntimeError(msg) from exc
+
+
 def load_credentials() -> dict[str, StoredCredential]:
     """Return all stored credentials keyed by provider name.
 
@@ -262,7 +300,19 @@ def _coerce_credential(raw: Any) -> StoredCredential | None:  # noqa: ANN401
         added_at = raw.get("added_at")
         if not isinstance(added_at, str):
             added_at = ""
-        return ApiKeyCredential(type="api_key", key=key, added_at=added_at)
+        credential = ApiKeyCredential(type="api_key", key=key, added_at=added_at)
+        base_url = raw.get("base_url")
+        if isinstance(base_url, str) and base_url:
+            credential["base_url"] = base_url
+        elif base_url is not None:
+            # Present but not a usable string (e.g. a hand-edit left an int or
+            # an empty value). Dropping it silently would pair the key with the
+            # provider default — possibly the wrong endpoint — with no trace, so
+            # log it. `base_url` is non-secret, so logging the value is safe.
+            logger.warning(
+                "Ignoring malformed base_url for a stored credential: %r", base_url
+            )
+        return credential
     # OAuth is reserved for a future PR — silently skip until the producer
     # path lands. `cred_type in {"oauth"}` falls through to None here.
     return None
@@ -285,7 +335,26 @@ def get_stored_key(provider: str) -> str | None:
     return entry["key"] or None
 
 
-def set_stored_key(provider: str, key: str) -> WriteOutcome:
+def get_stored_base_url(provider: str) -> str | None:
+    """Return the base URL paired with `provider`'s stored key, or `None`.
+
+    Returns `None` both when no key is stored and when a key is stored without
+    an accompanying base URL (the user left the field blank, meaning "use the
+    provider default"). Callers distinguish the two via `get_stored_key`.
+
+    Raises:
+        RuntimeError: If the credential file is corrupt.
+    """  # noqa: DOC502 - re-raised from `_read_raw` via `load_credentials`
+    creds = load_credentials()
+    entry = creds.get(provider)
+    if entry is None or entry["type"] != "api_key":
+        return None
+    return entry.get("base_url") or None
+
+
+def set_stored_key(
+    provider: str, key: str, *, base_url: str | None = None
+) -> WriteOutcome:
     """Persist an API key for `provider`.
 
     Empty / whitespace-only keys are rejected so callers don't accidentally
@@ -296,6 +365,9 @@ def set_stored_key(provider: str, key: str) -> WriteOutcome:
     Args:
         provider: Provider identifier (e.g., `"anthropic"`).
         key: The API key value. Whitespace is stripped before storage.
+        base_url: Optional provider endpoint to pair with the key. Whitespace
+            is stripped; blank/`None` stores no endpoint, meaning the key uses
+            the provider default rather than any inherited (e.g. gateway) URL.
 
     Returns:
         A `WriteOutcome` whose `warnings` tuple lists chmod failures the
@@ -303,8 +375,10 @@ def set_stored_key(provider: str, key: str) -> WriteOutcome:
 
     Raises:
         ValueError: If `provider` or the stripped `key` is empty.
-        RuntimeError: If the credential file is corrupt and cannot be read.
-    """  # noqa: DOC502 - `RuntimeError` is re-raised from `_read_raw`
+        RuntimeError: If the credential file is corrupt and cannot be read, or
+            the new file cannot be written (e.g. no disk space or an
+            unwritable state directory).
+    """  # noqa: DOC502 - `RuntimeError` re-raised from `_read_raw`/`_write_raw_or_raise`
     if not provider:
         msg = "Provider name cannot be empty"
         raise ValueError(msg)
@@ -316,14 +390,18 @@ def set_stored_key(provider: str, key: str) -> WriteOutcome:
     creds = data.get("credentials")
     if not isinstance(creds, dict):
         creds = {}
-    creds[provider] = {
+    entry: dict[str, str] = {
         "type": "api_key",
         "key": cleaned,
         "added_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
     }
+    cleaned_base_url = base_url.strip() if base_url else ""
+    if cleaned_base_url:
+        entry["base_url"] = cleaned_base_url
+    creds[provider] = entry
     data["version"] = _STORAGE_VERSION
     data["credentials"] = creds
-    warnings = _write_raw(data)
+    warnings = _write_raw_or_raise(data)
     logger.debug("Stored credential for provider %s", provider)
     return WriteOutcome(warnings=warnings)
 
@@ -338,8 +416,10 @@ def delete_stored_key(provider: str) -> bool:
         `True` if a credential was removed, `False` if none was stored.
 
     Raises:
-        RuntimeError: If the credential file is corrupt and cannot be read.
-    """  # noqa: DOC502 - re-raised from `_read_raw`
+        RuntimeError: If the credential file is corrupt and cannot be read, or
+            the rewrite cannot be written (e.g. no disk space or an unwritable
+            state directory).
+    """  # noqa: DOC502 - re-raised from `_read_raw`/`_write_raw_or_raise`
     data = _read_raw()
     if data is None:
         return False
@@ -349,7 +429,7 @@ def delete_stored_key(provider: str) -> bool:
     del creds[provider]
     data["version"] = _STORAGE_VERSION
     data["credentials"] = creds
-    _write_raw(data)
+    _write_raw_or_raise(data)
     logger.debug("Deleted credential for provider %s", provider)
     return True
 

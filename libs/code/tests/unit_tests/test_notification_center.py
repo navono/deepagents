@@ -49,12 +49,18 @@ def _update_entry() -> PendingNotification:
             NotificationAction(ActionId.SKIP_ONCE, "Remind me next launch"),
             NotificationAction(ActionId.SKIP_VERSION, "Skip this version"),
         ),
-        payload=UpdateAvailablePayload(latest="2.0.0", upgrade_cmd="pip install"),
+        payload=UpdateAvailablePayload(
+            latest="2.0.0", upgrade_cmd="uv tool upgrade deepagents-code"
+        ),
     )
 
 
 class TestNotificationCenterScreen:
     """Drill-in behavior tests for the list-of-notifications modal."""
+
+    def test_uses_modal_backdrop(self) -> None:
+        """The center should keep Textual's dimmed modal backdrop."""
+        assert "background: transparent" not in NotificationCenterScreen.CSS
 
     async def test_renders_one_row_per_notification(self) -> None:
         """Each pending entry shows up as a single `_NotificationRow`."""

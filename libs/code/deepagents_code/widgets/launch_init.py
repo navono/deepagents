@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from deepagents_code.extras_info import ExtraDependencyStatus
 
 from deepagents_code import theme
-from deepagents_code.config import get_glyphs, is_ascii_mode
+from deepagents_code.config import is_ascii_mode
 from deepagents_code.extras_info import MODEL_PROVIDER_EXTRAS, SANDBOX_EXTRAS
 
 logger = logging.getLogger(__name__)
@@ -109,14 +109,10 @@ class LaunchNameScreen(ModalScreen[str | None]):
         Yields:
             Widgets for the modal content.
         """
-        glyphs = get_glyphs()
         with Vertical():
             yield Static("Welcome to Deep Agents", classes="launch-init-title")
             yield Static(
-                Content.assemble(
-                    "What should Deep Agents call you? This is optional and "
-                    "will be remembered for future sessions."
-                ),
+                Content.assemble("What should Deep Agents call you?"),
                 classes="launch-init-copy",
             )
             yield Input(
@@ -124,7 +120,7 @@ class LaunchNameScreen(ModalScreen[str | None]):
                 id="launch-name-input",
             )
             yield Static(
-                f"Enter to continue {glyphs.bullet} Esc skip setup",
+                "Enter to continue",
                 classes="launch-init-help",
             )
 
@@ -237,12 +233,12 @@ class LaunchDependenciesScreen(ModalScreen[bool | None]):
         Yields:
             Widgets for the modal content.
         """
-        glyphs = get_glyphs()
         with Vertical():
             yield Static("Installed Integrations", classes="launch-init-title")
             yield Static(
-                "Deep Agents uses installed optional packages to decide which "
-                "providers and runtime integrations are ready now.",
+                "Model providers and sandboxes are enabled by optional add-on "
+                "packages. The ones already present in your environment are "
+                "ready to use now; you can add others anytime with `/install`.",
                 classes="launch-init-copy",
             )
             if self._statuses:
@@ -261,11 +257,11 @@ class LaunchDependenciesScreen(ModalScreen[bool | None]):
                 # single explanatory line instead of "none detected" twice.
                 yield Static(
                     "Could not read installed dependency metadata. Reinstall "
-                    "with `pip install deepagents-code[<extra>]` to populate.",
+                    "with `/install <extra>` to populate.",
                     classes="launch-dependencies-section",
                 )
             yield Static(
-                f"Enter to continue {glyphs.bullet} Esc skip setup",
+                "Enter to continue",
                 classes="launch-init-help",
             )
 

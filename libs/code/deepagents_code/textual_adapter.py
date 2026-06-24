@@ -47,10 +47,11 @@ if TYPE_CHECKING:
 
 
 from deepagents_code._ask_user_types import AskUserRequest
-from deepagents_code._cli_context import CLIContext  # noqa: TC001
-from deepagents_code._debug import configure_debug_logging
+from deepagents_code._cli_context import CLIContext
+from deepagents_code._constants import SYSTEM_MESSAGE_PREFIX
 from deepagents_code._session_stats import (
     ModelStats as ModelStats,
+    ModelStatsKey as ModelStatsKey,
     SessionStats as SessionStats,
     SpinnerStatus as SpinnerStatus,
     format_token_count as format_token_count,
@@ -71,7 +72,6 @@ from deepagents_code.widgets.messages import (
 )
 
 logger = logging.getLogger(__name__)
-configure_debug_logging(logger)
 
 _hitl_adapter_cache: TypeAdapter | None = None
 """Lazy singleton for the HITL request validator."""
@@ -109,8 +109,9 @@ def print_usage_table(
 ) -> None:
     """Print a model-usage stats table to a Rich console.
 
-    When the session spans multiple models each gets its own row with a
-    totals row appended; single-model sessions show one row.
+    Each row shows the serving provider alongside the model name. When the
+    session spans multiple models each gets its own row with a totals row
+    appended; single-model sessions show one row.
 
     Args:
         stats: Cumulative session stats.
@@ -133,29 +134,33 @@ def print_usage_table(
             padding=(0, 2, 0, 0),
             show_edge=False,
         )
+        table.add_column("Provider", style="dim")
         table.add_column("Model", style="dim")
         table.add_column("Reqs", justify="right", style="dim")
         table.add_column("InputTok", justify="right", style="dim")
         table.add_column("OutputTok", justify="right", style="dim")
 
         if multi_model:
-            for model_name, ms in stats.per_model.items():
+            for ms in stats.per_model.values():
                 table.add_row(
-                    model_name,
+                    ms.provider,
+                    ms.model_name,
                     str(ms.request_count),
                     format_token_count(ms.input_tokens),
                     format_token_count(ms.output_tokens),
                 )
             table.add_row(
+                "",
                 "Total",
                 str(stats.request_count),
                 format_token_count(stats.input_tokens),
                 format_token_count(stats.output_tokens),
             )
         else:
-            model_label = next(iter(stats.per_model))
+            ms = next(iter(stats.per_model.values()))
             table.add_row(
-                model_label,
+                ms.provider,
+                ms.model_name,
                 str(stats.request_count),
                 format_token_count(stats.input_tokens),
                 format_token_count(stats.output_tokens),
@@ -396,8 +401,11 @@ async def execute_task_textual(
         adapter: The TextualUIAdapter for UI operations
         backend: Optional backend for file operations
         image_tracker: Optional tracker for images
-        context: Optional `CLIContext` with model override and params, passed
-            to the graph via `context=`.
+        context: Optional `CLIContext` with model override and params. The
+            current approval mode (`session_state.auto_approve`) is written
+            into `context["auto_approve"]` on every stream iteration before it
+            is passed to the graph via `context=`, so the `interrupt_on` `when`
+            predicate can suppress interrupts at the source.
         sandbox_type: Sandbox provider name for trace metadata, or `None`
             if no sandbox is active.
         message_kwargs: Extra fields merged into the stream input message
@@ -514,6 +522,10 @@ async def execute_task_textual(
     user_msg: dict[str, Any] = {"role": "user", "content": message_content}
     if message_kwargs:
         user_msg.update(message_kwargs)
+    # Auto-approve is carried via run context (set per stream iteration below),
+    # not graph state — so the initial input is a plain dict. A first-turn
+    # `Command(update=...)` would be rebuilt with `goto=None` by the LangGraph
+    # API server and crash `_control_branch` on a fresh thread.
     stream_input: dict | Command = {"messages": [user_msg]}
 
     # Track summarization lifecycle so spinner status and notification stay in sync.
@@ -525,6 +537,14 @@ async def execute_task_textual(
             suppress_resumed_output = False
             pending_interrupts: dict[str, HITLRequest] = {}
             pending_ask_user: dict[str, AskUserRequest] = {}
+
+            # Carry the current approval mode into run context so the
+            # `interrupt_on` `when` predicate can suppress interrupts at the
+            # source. Refreshed each iteration so enabling "approve always"
+            # mid-turn propagates to the resuming stream.
+            if context is None:
+                context = CLIContext()
+            context["auto_approve"] = bool(session_state.auto_approve)
 
             # Show the Thinking spinner before each astream iteration so
             # both the first turn and HITL/ask_user resumes surface feedback
@@ -770,17 +790,23 @@ async def execute_task_textual(
                             from deepagents_code.config import settings
 
                             active_model = settings.model_name or ""
+                            active_provider = settings.model_provider or ""
                             if input_toks or output_toks:
                                 # Model gives split counts — preferred path
                                 turn_stats.record_request(
-                                    active_model, input_toks, output_toks
+                                    active_model,
+                                    input_toks,
+                                    output_toks,
+                                    active_provider,
                                 )
                                 captured_input_tokens = max(
                                     captured_input_tokens, input_toks + output_toks
                                 )
                             elif total_toks:
                                 # Fallback: model gives only total (no split)
-                                turn_stats.record_request(active_model, total_toks, 0)
+                                turn_stats.record_request(
+                                    active_model, total_toks, 0, active_provider
+                                )
                                 captured_input_tokens = max(
                                     captured_input_tokens, total_toks
                                 )
@@ -795,11 +821,12 @@ async def execute_task_textual(
 
                     # Process content blocks
                     blocks = message.content_blocks
-                    logger.debug(
-                        "content_blocks count=%d blocks=%s",
-                        len(blocks),
-                        repr(blocks)[:500],
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "content_blocks count=%d blocks=%s",
+                            len(blocks),
+                            repr(blocks)[:500],
+                        )
                     for block in blocks:
                         block_type = block.get("type")
 
@@ -883,7 +910,6 @@ async def execute_task_textual(
                                     )
                                     if not parts or chunk_args != parts[-1]:
                                         parts.append(chunk_args)
-                                    buffer["args"] = "".join(parts)
                             elif chunk_args is not None:
                                 buffer["args"] = chunk_args
 
@@ -892,19 +918,43 @@ async def execute_task_textual(
                             if buffer_name is None:
                                 continue
 
-                            parsed_args = buffer.get("args")
-                            if isinstance(parsed_args, str):
-                                if not parsed_args:
+                            # Resolve the tool arguments. String fragments are
+                            # accumulated in `args_parts` and joined + parsed
+                            # once the buffer holds a complete JSON value. Re-
+                            # joining and re-parsing the whole prefix on every
+                            # fragment is O(n^2) and ran on the UI event loop for
+                            # large `edit_file` blobs. Each `continue` below
+                            # leaves the buffer in `tool_call_buffers` so the next
+                            # fragment keeps accumulating; it is popped only after
+                            # a successful parse + mount.
+                            direct_args = buffer.get("args")
+                            if isinstance(direct_args, dict):
+                                parsed_args = direct_args
+                            elif direct_args is not None:
+                                parsed_args = {"value": direct_args}
+                            else:
+                                parts = buffer.get("args_parts") or []
+                                if not parts:
+                                    continue
+                                joined = "".join(parts)
+                                stripped = joined.strip()
+                                if not stripped:
+                                    continue
+                                # Objects/arrays can be large (e.g. `edit_file`
+                                # blobs), so defer parsing until the closing
+                                # bracket arrives. Scalars are always small and
+                                # never end in `}`/`]`, so parse them eagerly
+                                # rather than leaving them stuck unparsed.
+                                if stripped[0] in "{[" and not stripped.endswith(
+                                    ("}", "]")
+                                ):
                                     continue
                                 try:
-                                    parsed_args = json.loads(parsed_args)
+                                    parsed_args = json.loads(joined)
                                 except json.JSONDecodeError:
                                     continue
-                            elif parsed_args is None:
-                                continue
-
-                            if not isinstance(parsed_args, dict):
-                                parsed_args = {"value": parsed_args}
+                                if not isinstance(parsed_args, dict):
+                                    parsed_args = {"value": parsed_args}
 
                             # Flush pending text before tool call
                             pending_text = pending_text_by_namespace.get(ns_key, "")
@@ -954,8 +1004,20 @@ async def execute_task_textual(
                                 tool_msg = ToolCallMessage(buffer_name, parsed_args)
                                 await adapter._mount_message(tool_msg)
                                 adapter._current_tool_messages[buffer_id] = tool_msg
-                                if adapter._set_spinner and keep_thinking_spinner:
-                                    await adapter._set_spinner("Thinking")
+                                if keep_thinking_spinner:
+                                    # The argument/approval phase uses the global
+                                    # "Thinking" spinner instead of a per-tool one.
+                                    if adapter._set_spinner:
+                                        await adapter._set_spinner("Thinking")
+                                else:
+                                    # Show a per-tool running spinner immediately so
+                                    # auto-executed tools such as grep, glob,
+                                    # read_file, and ls display activity instead of
+                                    # sitting idle until their result arrives. Every
+                                    # tool outside the frozenset hits this branch;
+                                    # those that go on to interrupt for approval are
+                                    # paused again below.
+                                    tool_msg.set_running()
 
                             tool_call_buffers.pop(buffer_key, None)
 
@@ -1000,13 +1062,29 @@ async def execute_task_textual(
                 ask_user_cancelled = False
                 resume_payload: dict[str, Any] = {}
 
+                # Tools mounted above start their spinner immediately, but a
+                # tool blocked on HITL approval or `ask_user` input is not
+                # actually running. Pause every in-flight row so none shows a
+                # misleading "Running..."; the approve branches below call
+                # `set_running` again to resume those that proceed. Guard each
+                # row individually so a single bad widget can't abort the whole
+                # interrupt handler (mirrors `clear_awaiting_approval` below).
+                for tool_msg in adapter._current_tool_messages.values():
+                    try:
+                        tool_msg.pause_running()
+                    except Exception:
+                        logger.exception(
+                            "Failed to pause running state on tool widget %s",
+                            tool_msg.tool_name,
+                        )
+
                 for interrupt_id, ask_req in list(pending_ask_user.items()):
                     questions = ask_req["questions"]
 
                     if adapter._request_ask_user:
                         if adapter._set_spinner:
                             await adapter._set_spinner(None)
-                        result: dict[str, Any] = {
+                        result: AskUserWidgetResult | dict[str, str] = {
                             "type": "error",
                             "error": "ask_user callback returned no response",
                         }
@@ -1190,6 +1268,12 @@ async def execute_task_textual(
 
                             if decision_type == "auto_approve_all":
                                 session_state.auto_approve = True
+                                # The resuming stream re-reads
+                                # `session_state.auto_approve` into run context
+                                # at the top of the loop, so the `interrupt_on`
+                                # `when` predicate suppresses interrupts on the
+                                # remaining tool calls in this turn — keeping it
+                                # a single run instead of resuming after each.
                                 if adapter._on_auto_approve_enabled:
                                     adapter._on_auto_approve_enabled()
                                 decisions = [
@@ -1314,7 +1398,7 @@ async def execute_task_textual(
                     await adapter._mount_message(AppMessage(message))
                     turn_stats.wall_time_seconds = time.monotonic() - start_time
                     # Model call already completed (HITL interrupt fires after
-                    # the model node); `TokenStateMiddleware.after_model`
+                    # the model node); `ResumeStateMiddleware.after_model`
                     # persisted the count, so only refresh UI here.
                     _report_tokens(
                         adapter,
@@ -1334,15 +1418,28 @@ async def execute_task_textual(
             agent=agent,
             config=config,
             pending_text_by_namespace=pending_text_by_namespace,
+            assistant_message_by_namespace=assistant_message_by_namespace,
             captured_input_tokens=captured_input_tokens,
             captured_output_tokens=captured_output_tokens,
             turn_stats=turn_stats,
             start_time=start_time,
         )
         return turn_stats
+    finally:
+        # Streamed text is coalesced in each AssistantMessage's `_pending_append`
+        # buffer and flushed on a throttled timer, so up to one flush interval of
+        # tokens can be in flight at any moment. Normal completion (the flush loop
+        # above) and interrupt cleanup both clear the namespace dict, leaving this
+        # a no-op there. The path that matters is a non-cancel mid-stream error
+        # propagating to the caller: without this drain those buffered tokens are
+        # never written and the user sees a silently truncated reply.
+        try:
+            await _stop_assistant_streams(adapter, assistant_message_by_namespace)
+        except Exception:  # drain must not mask the original error
+            logger.exception("Failed to drain assistant streams on exit")
 
     # Update token count and return stats. Persistence is handled inside the
-    # graph by `TokenStateMiddleware.after_model`, so this only refreshes UI.
+    # graph by `ResumeStateMiddleware.after_model`, so this only refreshes UI.
     turn_stats.wall_time_seconds = time.monotonic() - start_time
     _report_tokens(
         adapter,
@@ -1352,12 +1449,34 @@ async def execute_task_textual(
     return turn_stats
 
 
+async def _stop_assistant_streams(
+    adapter: TextualUIAdapter,
+    assistant_message_by_namespace: dict[tuple, Any] | None,
+) -> None:
+    """Finalize active assistant streams during interrupt cleanup."""
+    if not assistant_message_by_namespace:
+        return
+
+    for current_msg in list(assistant_message_by_namespace.values()):
+        try:
+            await current_msg.stop_stream()
+        except Exception:
+            logger.warning("Failed to stop interrupted assistant stream", exc_info=True)
+            continue
+
+        if adapter._sync_message_content and current_msg.id:
+            adapter._sync_message_content(current_msg.id, current_msg._content)
+
+    assistant_message_by_namespace.clear()
+
+
 async def _handle_interrupt_cleanup(
     *,
     adapter: TextualUIAdapter,
     agent: Any,  # noqa: ANN401  # Dynamic agent graph type
     config: RunnableConfig,
     pending_text_by_namespace: dict[tuple, str],
+    assistant_message_by_namespace: dict[tuple, Any] | None = None,
     captured_input_tokens: int,
     captured_output_tokens: int,
     turn_stats: SessionStats,
@@ -1370,6 +1489,7 @@ async def _handle_interrupt_cleanup(
         agent: The LangGraph agent.
         config: Runnable config with `thread_id`.
         pending_text_by_namespace: Accumulated text per namespace.
+        assistant_message_by_namespace: Active assistant message widgets per namespace.
         captured_input_tokens: Input tokens captured before interrupt.
         captured_output_tokens: Output tokens captured before interrupt.
         turn_stats: Stats for the current turn.
@@ -1387,6 +1507,8 @@ async def _handle_interrupt_cleanup(
     # Hide spinner (may still show "Offloading" if interrupted mid-offload)
     if adapter._set_spinner:
         await adapter._set_spinner(None)
+
+    await _stop_assistant_streams(adapter, assistant_message_by_namespace)
 
     await adapter._mount_message(AppMessage("Interrupted by user"))
 
@@ -1411,7 +1533,7 @@ async def _handle_interrupt_cleanup(
                 await agent.aupdate_state(config, {"messages": [interrupted_msg]})
 
             cancellation_msg = HumanMessage(
-                content="[SYSTEM] Task interrupted by user. "
+                content=f"{SYSTEM_MESSAGE_PREFIX} Task interrupted by user. "
                 "Previous operation was cancelled."
             )
             cancellation_values: dict[str, Any] = {"messages": [cancellation_msg]}
@@ -1466,7 +1588,7 @@ def _report_tokens(
 ) -> None:
     """Refresh the token-count UI display.
 
-    Persistence into graph state is owned by `TokenStateMiddleware.after_model`
+    Persistence into graph state is owned by `ResumeStateMiddleware.after_model`
     (normal turns), `_handle_offload` (offload turns), and the interrupt-cleanup
     `aupdate_state` write (partial turns) — never this helper.
 
